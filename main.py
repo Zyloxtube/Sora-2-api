@@ -1,14 +1,23 @@
 import os
 import re
 import time
-import requests
+import threading
+import uuid
+from flask import Flask, request, jsonify
 from pycognito import Cognito
 from urllib.parse import urlparse
 import base64 as _base64
 from html.parser import HTMLParser
 from Crypto.PublicKey import RSA
 from Crypto.Cipher import PKCS1_v1_5
+import requests
 
+app = Flask(__name__)
+
+# Store jobs in memory
+jobs = {}
+
+# Configuration
 PASSWORD = "Test1234Abc!"
 COGNITO_CLIENT_ID = "1kvg8re5bgu9ljqnnkjosu477k"
 USER_POOL_ID = "eu-west-1_7hEawdalF"
@@ -255,10 +264,8 @@ def create_workspace(id_token):
 
 # ─── Synthesia video generation ───────────────────────────────────────────────
 
-def start_synthesia_generation(token, workspace_id, prompt, size):
+def start_synthesia_generation(token, workspace_id, prompt, aspect_ratio):
     try:
-        aspect_ratio = "9:16"  # Fixed for portrait video
-        
         model_request = {
             "modelName": "sora_2",
             "generateAudio": True,
@@ -301,71 +308,183 @@ def poll_synthesia(token, asset_id, timeout=600, interval=8):
                 return data
             if status == "failed":
                 raise RuntimeError("Generation failed on Synthesia side.")
-            print(f"⏳ Status: {status}, waiting...")
             time.sleep(interval)
         except requests.exceptions.RequestException as e:
-            print(f"Polling error: {e}, retrying...")
             time.sleep(interval)
     raise TimeoutError("Generation timed out after 10 minutes.")
 
-def generate_sora_video(prompt: str) -> str:
-    """Generate a Sora video with 9:16 aspect ratio and return the video URL"""
+def generate_sora_video(prompt: str, aspect_ratio: str = "9:16") -> dict:
+    """Generate a Sora video and return account info and video URL"""
     
-    print("📧 Creating temporary email...")
+    # Create temporary email
     temp = TempEmail()
     email = temp.generate()
-    print(f"✅ Email created: {email}")
-
-    print("📝 Signing up with Cognito...")
-    sign_up_with_cognito(email)
-
-    print("✉️ Waiting for verification code...")
+    
+    # Sign up with Cognito
+    sign_up_result = sign_up_with_cognito(email)
+    
+    # Wait for verification code
     code = temp.wait_for_code(timeout=120)
     if not code:
         raise RuntimeError("Timed out waiting for email verification code.")
-    print(f"✅ Verification code received: {code}")
-
-    print("🔐 Confirming sign up...")
+    
+    # Confirm sign up
     confirm_sign_up_with_cognito(email, code)
     
-    print("🔑 Signing in...")
+    # Sign in
     token = sign_in_with_cognito(email)
     
-    print("🛠️ Creating workspace...")
+    # Create workspace
     workspace_id = create_workspace(token)
     
-    print(f"🎨 Generating Sora video with prompt: '{prompt}' (9:16 aspect ratio)...")
-    asset_id = start_synthesia_generation(token, workspace_id, prompt, "720x1280")
-    print(f"📹 Asset ID: {asset_id}")
+    # Generate video
+    asset_id = start_synthesia_generation(token, workspace_id, prompt, aspect_ratio)
     
-    print("⏳ Polling for completion...")
+    # Poll for completion
     result = poll_synthesia(token, asset_id)
     
     video_url = result.get("url", "")
     if not video_url:
         raise RuntimeError("No video URL in response")
     
-    return video_url
+    return {
+        "email": email,
+        "token": token,
+        "workspace_id": workspace_id,
+        "asset_id": asset_id,
+        "video_url": video_url
+    }
 
-# ─── Main execution ───────────────────────────────────────────────────────────
+# ─── Background task for video generation ───────────────────────────────────
 
-if __name__ == "__main__":
-    # Set your prompt here
-    PROMPT = "a cute cat playing in a garden"
-    
+def run_generation_task(job_id, prompt, aspect_ratio):
     try:
-        print("🚀 Starting Sora video generation...")
-        print(f"📝 Prompt: {PROMPT}")
-        print("📏 Size: 9:16")
+        # Update status to processing
+        jobs[job_id]["status"] = "processing"
+        jobs[job_id]["message"] = "Starting video generation..."
         
-        video_link = generate_sora_video(PROMPT)
-        c
-        print("\n" + "="*60)
-        print("✅ VIDEO GENERATED SUCCESSFULLY!")
-        print("="*60)
-        print(f"🔗 VIDEO LINK: {video_link}")
-        print("="*60)
+        # Generate the video
+        result = generate_sora_video(prompt, aspect_ratio)
+        
+        # Update job with success
+        jobs[job_id]["status"] = "done"
+        jobs[job_id]["error"] = None
+        jobs[job_id]["video_url"] = result["video_url"]
+        jobs[job_id]["email"] = result["email"]
+        jobs[job_id]["message"] = "Video generated successfully"
+        jobs[job_id]["completed_at"] = time.time()
+        
+        # Schedule cleanup after 30 minutes
+        def cleanup():
+            time.sleep(30 * 60)
+            jobs.pop(job_id, None)
+        
+        cleanup_thread = threading.Thread(target=cleanup)
+        cleanup_thread.start()
         
     except Exception as e:
-        print(f"\n❌ Error: {str(e)}")
-        exit(1)
+        # Update job with error
+        jobs[job_id]["status"] = "failed"
+        jobs[job_id]["error"] = str(e)
+        jobs[job_id]["video_url"] = None
+        jobs[job_id]["message"] = f"Generation failed: {str(e)}"
+        jobs[job_id]["completed_at"] = time.time()
+        
+        # Schedule cleanup after 30 minutes
+        def cleanup():
+            time.sleep(30 * 60)
+            jobs.pop(job_id, None)
+        
+        cleanup_thread = threading.Thread(target=cleanup)
+        cleanup_thread.start()
+
+# ─── Flask Routes ───────────────────────────────────────────────────────────
+
+@app.route('/ping', methods=['GET'])
+def ping():
+    """Health check endpoint to keep the service awake"""
+    return "pong"
+
+@app.route('/generate', methods=['GET'])
+def generate_video():
+    """Start video generation with prompt and aspect ratio"""
+    prompt = request.args.get('prompt')
+    aspect_ratio = request.args.get('size', '9:16')
+    
+    # Validate prompt
+    if not prompt:
+        return jsonify({"error": "Missing 'prompt' parameter"}), 400
+    
+    # Validate aspect ratio
+    if aspect_ratio not in ['9:16', '16:9']:
+        return jsonify({"error": "Invalid size. Use '9:16' or '16:9'"}), 400
+    
+    # Create job
+    job_id = str(uuid.uuid4())
+    jobs[job_id] = {
+        "status": "pending",
+        "error": None,
+        "video_url": None,
+        "prompt": prompt,
+        "aspect_ratio": aspect_ratio,
+        "created_at": time.time(),
+        "message": "Job created, waiting to start"
+    }
+    
+    # Start background task
+    thread = threading.Thread(target=run_generation_task, args=(job_id, prompt, aspect_ratio))
+    thread.start()
+    
+    return jsonify({
+        "job_id": job_id,
+        "message": "Video generation started",
+        "status_url": f"/status?jobid={job_id}"
+    })
+
+@app.route('/status', methods=['GET'])
+def get_status():
+    """Get the status of a video generation job"""
+    job_id = request.args.get('jobid')
+    
+    if not job_id:
+        return jsonify({"error": "Missing 'jobid' parameter"}), 400
+    
+    job = jobs.get(job_id)
+    
+    if not job:
+        return jsonify({"error": "Job not found"}), 404
+    
+    # Return status in the requested format
+    response = {
+        "status": job["status"],
+        "error": job.get("error"),
+        "video": job.get("video_url")
+    }
+    
+    # Include additional info if available
+    if "message" in job:
+        response["message"] = job["message"]
+    
+    return jsonify(response)
+
+@app.route('/jobs', methods=['GET'])
+def list_jobs():
+    """List all active jobs"""
+    active_jobs = {}
+    for job_id, job in jobs.items():
+        active_jobs[job_id] = {
+            "status": job["status"],
+            "prompt": job["prompt"],
+            "aspect_ratio": job["aspect_ratio"],
+            "created_at": job["created_at"],
+            "message": job.get("message")
+        }
+    
+    return jsonify({
+        "active_jobs": len(active_jobs),
+        "jobs": active_jobs
+    })
+
+if __name__ == '__main__':
+    port = int(os.environ.get('PORT', 5000))
+    app.run(host='0.0.0.0', port=port, debug=False)
