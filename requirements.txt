@@ -1,4 +1,4 @@
 Flask==2.3.3
-pycognito==2024.3.0
+pycognito
 requests==2.31.0
 pycryptodome==3.19.0
