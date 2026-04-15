@@ -114,7 +114,7 @@ class TempEmail:
             time.sleep(interval)
         return None
 
-# ─── Cognito auth ─────────────────────────────────────────────────────────────
+# ─── Cognito auth (FIXED - exactly like Discord bot) ─────────────────────────
 
 def sign_up_with_cognito(email):
     try:
@@ -125,16 +125,20 @@ def sign_up_with_cognito(email):
             username=email,
             user_pool_region="eu-west-1",
         )
-        cognito.add_custom_attributes({"email": email})
-        cognito.register(email, PASSWORD)
+        # Set attributes directly without add_custom_attributes
+        cognito.email = email
+        cognito.given_name = "User"
+        cognito.family_name = "Test"
+        # Register the user
+        cognito.register(username=email, password=PASSWORD)
         logger.info(f"Sign up successful for: {email}")
-        return {"status": "success"}
+        return {"status": "success", "message": "User signed up, waiting for confirmation"}
     except Exception as e:
         error_msg = str(e)
         logger.error(f"Sign up error: {error_msg}")
         if "User already exists" in error_msg or "UsernameExistsException" in error_msg:
             logger.info(f"User already exists: {email}")
-            return {"status": "exists"}
+            return {"status": "exists", "message": "User already exists"}
         raise RuntimeError(f"Sign-up failed: {error_msg}")
 
 def confirm_sign_up_with_cognito(email, code):
@@ -146,7 +150,7 @@ def confirm_sign_up_with_cognito(email, code):
             username=email,
             user_pool_region="eu-west-1",
         )
-        cognito.confirm_sign_up(code)
+        cognito.confirm_sign_up(confirmation_code=code)
         logger.info(f"Confirmation successful for: {email}")
         return True
     except Exception as e:
@@ -166,7 +170,7 @@ def sign_in_with_cognito(email):
         cognito.authenticate(password=PASSWORD)
         id_token = cognito.id_token
         if not id_token:
-            raise RuntimeError("Failed to get ID token")
+            raise RuntimeError("Failed to get ID token after authentication")
         logger.info(f"Sign in successful for: {email}")
         return id_token
     except Exception as e:
@@ -224,6 +228,10 @@ def create_workspace(id_token):
             json={"workspaceId": workspace_id},
             timeout=10,
         )
+    except Exception:
+        pass
+    
+    try:
         requests.post(
             "https://api.synthesia.io/user/onboarding/initialize",
             headers=headers,
@@ -234,6 +242,47 @@ def create_workspace(id_token):
             },
             timeout=10,
         )
+    except Exception:
+        pass
+    
+    for _ in range(5):
+        try:
+            res = requests.post(
+                "https://api.synthesia.io/user/onboarding/completeCurrentStep",
+                headers=headers,
+                json={"featureFlags": {"freemiumEnabled": True}},
+                timeout=10,
+            )
+            if res.status_code != 200:
+                break
+        except Exception:
+            break
+    
+    try:
+        requests.post(
+            "https://api.synthesia.io/user/questionnaire",
+            headers=headers,
+            json={
+                "company": {"size": "emerging", "industry": "professional_services"},
+                "seniority": "individual_contributor",
+                "persona": "marketing",
+            },
+            timeout=10,
+        )
+    except Exception:
+        pass
+    
+    try:
+        requests.post(
+            "https://api.synthesia.io/user/signupForm",
+            headers=headers,
+            json={"analyticsCookies": {}},
+            timeout=10,
+        )
+    except Exception:
+        pass
+    
+    try:
         requests.post(
             f"https://api.synthesia.io/billing/self-serve/{workspace_id}/paywall",
             headers=headers,
@@ -243,10 +292,11 @@ def create_workspace(id_token):
             },
             timeout=10,
         )
-    except Exception as e:
-        logger.warning(f"Onboarding steps failed (non-critical): {e}")
+    except Exception:
+        pass
     
     logger.info("Workspace setup complete")
+    time.sleep(30)  # Wait for workspace to be fully ready
     return workspace_id
 
 # ─── Synthesia video generation ───────────────────────────────────────────────
