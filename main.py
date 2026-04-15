@@ -3,14 +3,14 @@ import re
 import time
 import threading
 import uuid
+import logging
 from flask import Flask, request, jsonify
 from pycognito import Cognito
-from urllib.parse import urlparse
-import base64 as _base64
-from html.parser import HTMLParser
-from Crypto.PublicKey import RSA
-from Crypto.Cipher import PKCS1_v1_5
 import requests
+
+# Set up logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
 
@@ -41,6 +41,7 @@ class TempEmail:
         raw = data["email_addr"]
         at = raw.find("@")
         self.email_addr = (raw[:at + 1] if at != -1 else raw + "@") + "sharklasers.com"
+        logger.info(f"Generated email: {self.email_addr}")
         return self.email_addr
 
     def check_inbox(self):
@@ -62,9 +63,10 @@ class TempEmail:
                 if not code:
                     code = self._fetch_body_code(email["mail_id"])
                 if code:
+                    logger.info(f"Found verification code: {code}")
                     return code
-        except Exception:
-            pass
+        except Exception as e:
+            logger.error(f"Error checking inbox: {e}")
         return None
 
     def _fetch_body_code(self, mail_id):
@@ -79,7 +81,8 @@ class TempEmail:
                 self._extract_code(d.get("mail_subject", ""))
                 or self._extract_code(body)
             )
-        except Exception:
+        except Exception as e:
+            logger.error(f"Error fetching body: {e}")
             return None
 
     @staticmethod
@@ -114,15 +117,15 @@ def sign_up_with_cognito(email):
             username=email,
             user_pool_region="eu-west-1",
         )
-        cognito.email = email
-        cognito.given_name = "User"
-        cognito.family_name = "Test"
-        cognito.register(username=email, password=PASSWORD)
-        return {"status": "success", "message": "User signed up, waiting for confirmation"}
+        cognito.add_custom_attributes({"email": email})
+        cognito.register(email, PASSWORD)
+        logger.info(f"Signed up: {email}")
+        return {"status": "success"}
     except Exception as e:
         error_msg = str(e)
         if "User already exists" in error_msg or "UsernameExistsException" in error_msg:
-            return {"status": "exists", "message": "User already exists"}
+            logger.info(f"User already exists: {email}")
+            return {"status": "exists"}
         raise RuntimeError(f"Sign-up failed: {error_msg}")
 
 def confirm_sign_up_with_cognito(email, code):
@@ -133,7 +136,8 @@ def confirm_sign_up_with_cognito(email, code):
             username=email,
             user_pool_region="eu-west-1",
         )
-        cognito.confirm_sign_up(confirmation_code=code)
+        cognito.confirm_sign_up(code)
+        logger.info(f"Confirmed sign up: {email}")
         return True
     except Exception as e:
         raise RuntimeError(f"Confirmation failed: {str(e)}")
@@ -149,26 +153,11 @@ def sign_in_with_cognito(email):
         cognito.authenticate(password=PASSWORD)
         id_token = cognito.id_token
         if not id_token:
-            raise RuntimeError("Failed to get ID token after authentication")
+            raise RuntimeError("Failed to get ID token")
+        logger.info(f"Signed in: {email}")
         return id_token
     except Exception as e:
-        error_msg = str(e)
-        if "NEW_PASSWORD_REQUIRED" in error_msg:
-            try:
-                cognito = Cognito(
-                    user_pool_id=USER_POOL_ID,
-                    client_id=COGNITO_CLIENT_ID,
-                    username=email,
-                    user_pool_region="eu-west-1",
-                )
-                cognito.authenticate(password=PASSWORD)
-                if hasattr(cognito, "new_password_required") and cognito.new_password_required:
-                    cognito.set_new_password_challenge(PASSWORD)
-                    cognito.authenticate(password=PASSWORD)
-                return cognito.id_token
-            except Exception as inner_e:
-                raise RuntimeError(f"Failed to handle password change: {str(inner_e)}")
-        raise RuntimeError(f"Authentication failed: {error_msg}")
+        raise RuntimeError(f"Authentication failed: {str(e)}")
 
 # ─── Synthesia workspace ───────────────────────────────────────────────────────
 
@@ -177,11 +166,15 @@ def create_workspace(id_token):
         "Authorization": id_token,
         "Content-Type": "application/json",
     }
+    
+    # Get or create workspace
     res = requests.get("https://api.synthesia.io/workspaces?scope=public", headers=headers)
     res.raise_for_status()
     data = res.json()
+    
     if data.get("results") and len(data["results"]) > 0:
         workspace_id = data["results"][0]["id"]
+        logger.info(f"Using existing workspace: {workspace_id}")
     else:
         res = requests.post(
             "https://api.synthesia.io/workspaces",
@@ -190,143 +183,101 @@ def create_workspace(id_token):
         )
         res.raise_for_status()
         workspace_id = res.json()["workspace"]["id"]
+        logger.info(f"Created new workspace: {workspace_id}")
 
+    # Complete onboarding steps
     try:
         requests.post(
             "https://api.synthesia.io/user/onboarding/setPreferredWorkspaceId",
             headers=headers,
             json={"workspaceId": workspace_id},
         )
-    except Exception:
-        pass
-
-    try:
         requests.post(
-            "https://api.synthesia.io/user/onboarding/initialize",
-            headers=headers,
-            json={
-                "featureFlags": {"freemiumEnabled": True},
-                "queryParams": {"paymentPlanType": "free"},
-                "allowReinitialize": False,
-            },
-        )
-    except Exception:
-        pass
-
-    for _ in range(5):
-        try:
-            res = requests.post(
-                "https://api.synthesia.io/user/onboarding/completeCurrentStep",
-                headers=headers,
-                json={"featureFlags": {"freemiumEnabled": True}},
-            )
-            if res.status_code != 200:
-                break
-        except Exception:
-            break
-
-    try:
-        requests.post(
-            "https://api.synthesia.io/user/questionnaire",
-            headers=headers,
-            json={
-                "company": {"size": "emerging", "industry": "professional_services"},
-                "seniority": "individual_contributor",
-                "persona": "marketing",
-            },
-        )
-    except Exception:
-        pass
-
-    try:
-        requests.post(
-            "https://api.synthesia.io/user/signupForm",
-            headers=headers,
-            json={"analyticsCookies": {}},
-        )
-    except Exception:
-        pass
-
-    try:
-        requests.post(
-            f"https://api.synthesia.io/billing/self-serve/{workspace_id}/paywall",
+            "https://api.synthesia.io/billing/self-serve/" + workspace_id + "/paywall",
             headers=headers,
             json={
                 "targetPlan": "freemium",
                 "redirectUrl": "https://app.synthesia.io/#/?plan_created=true&payment_plan=freemium",
             },
         )
-    except Exception:
-        pass
-
-    time.sleep(30)
+    except Exception as e:
+        logger.warning(f"Onboarding step failed: {e}")
+    
+    time.sleep(5)
     return workspace_id
 
 # ─── Synthesia video generation ───────────────────────────────────────────────
 
 def start_synthesia_generation(token, workspace_id, prompt, aspect_ratio):
-    try:
-        model_request = {
-            "modelName": "sora_2",
-            "generateAudio": True,
-            "aspectRatio": aspect_ratio,
-        }
-        media_type = "video"
-
-        r = requests.post(
-            "https://api.prd.synthesia.io/avatarServices/api/generatedMedia/stockFootage/bulk?numberOfResults=1",
-            headers={"Authorization": token, "Content-Type": "application/json"},
-            json={
-                "mediaType": media_type,
-                "modelRequest": model_request,
-                "userPrompt": prompt,
-                "workspaceId": workspace_id,
-            },
-            timeout=30,
-        )
-        r.raise_for_status()
-        result = r.json()
-        if not result or len(result) == 0:
-            raise RuntimeError("No asset ID returned from Synthesia")
-        return result[0]["mediaAssetId"]
-    except requests.exceptions.RequestException as e:
-        raise RuntimeError(f"Failed to start generation: {str(e)}")
+    model_request = {
+        "modelName": "sora_2",
+        "generateAudio": True,
+        "aspectRatio": aspect_ratio,
+    }
+    
+    r = requests.post(
+        "https://api.prd.synthesia.io/avatarServices/api/generatedMedia/stockFootage/bulk?numberOfResults=1",
+        headers={"Authorization": token, "Content-Type": "application/json"},
+        json={
+            "mediaType": "video",
+            "modelRequest": model_request,
+            "userPrompt": prompt,
+            "workspaceId": workspace_id,
+        },
+        timeout=30,
+    )
+    r.raise_for_status()
+    result = r.json()
+    
+    if not result or len(result) == 0:
+        raise RuntimeError("No asset ID returned")
+    
+    asset_id = result[0]["mediaAssetId"]
+    logger.info(f"Started generation, asset ID: {asset_id}")
+    return asset_id
 
 def poll_synthesia(token, asset_id, timeout=600, interval=8):
     deadline = time.time() + timeout
     while time.time() < deadline:
-        try:
-            r = requests.get(
-                f"https://api.synthesia.io/assets/{asset_id}",
-                headers={"Authorization": token},
-                timeout=20,
-            )
-            r.raise_for_status()
-            data = r.json()
-            status = data.get("uploadMetadata", {}).get("status", "unknown")
-            if status == "ready":
-                return data
-            if status == "failed":
-                raise RuntimeError("Generation failed on Synthesia side.")
-            time.sleep(interval)
-        except requests.exceptions.RequestException as e:
-            time.sleep(interval)
-    raise TimeoutError("Generation timed out after 10 minutes.")
+        r = requests.get(
+            f"https://api.synthesia.io/assets/{asset_id}",
+            headers={"Authorization": token},
+            timeout=20,
+        )
+        r.raise_for_status()
+        data = r.json()
+        status = data.get("uploadMetadata", {}).get("status", "unknown")
+        
+        logger.info(f"Polling status: {status}")
+        
+        if status == "ready":
+            return data
+        if status == "failed":
+            raise RuntimeError("Generation failed on Synthesia side")
+        
+        time.sleep(interval)
+    
+    raise TimeoutError("Generation timed out after 10 minutes")
 
 def generate_sora_video(prompt: str, aspect_ratio: str = "9:16") -> dict:
-    """Generate a Sora video and return account info and video URL"""
+    """Generate a Sora video and return the video URL"""
+    
+    logger.info(f"Starting video generation with prompt: {prompt}, ratio: {aspect_ratio}")
     
     # Create temporary email
     temp = TempEmail()
     email = temp.generate()
+    logger.info(f"Email created: {email}")
     
-    # Sign up with Cognito
+    # Sign up
     sign_up_result = sign_up_with_cognito(email)
     
     # Wait for verification code
+    logger.info("Waiting for verification code...")
     code = temp.wait_for_code(timeout=120)
     if not code:
-        raise RuntimeError("Timed out waiting for email verification code.")
+        raise RuntimeError("Timed out waiting for email verification code")
+    logger.info(f"Verification code received: {code}")
     
     # Confirm sign up
     confirm_sign_up_with_cognito(email, code)
@@ -337,7 +288,7 @@ def generate_sora_video(prompt: str, aspect_ratio: str = "9:16") -> dict:
     # Create workspace
     workspace_id = create_workspace(token)
     
-    # Generate video
+    # Start generation
     asset_id = start_synthesia_generation(token, workspace_id, prompt, aspect_ratio)
     
     # Poll for completion
@@ -347,21 +298,23 @@ def generate_sora_video(prompt: str, aspect_ratio: str = "9:16") -> dict:
     if not video_url:
         raise RuntimeError("No video URL in response")
     
+    logger.info(f"Video generated successfully: {video_url}")
+    
     return {
+        "video_url": video_url,
         "email": email,
-        "token": token,
-        "workspace_id": workspace_id,
-        "asset_id": asset_id,
-        "video_url": video_url
+        "asset_id": asset_id
     }
 
-# ─── Background task for video generation ───────────────────────────────────
+# ─── Background task ───────────────────────────────────────────────────────────
 
 def run_generation_task(job_id, prompt, aspect_ratio):
+    """Background task to generate video and update job status"""
     try:
         # Update status to processing
         jobs[job_id]["status"] = "processing"
         jobs[job_id]["message"] = "Starting video generation..."
+        logger.info(f"Job {job_id}: Starting generation")
         
         # Generate the video
         result = generate_sora_video(prompt, aspect_ratio)
@@ -369,53 +322,51 @@ def run_generation_task(job_id, prompt, aspect_ratio):
         # Update job with success
         jobs[job_id]["status"] = "done"
         jobs[job_id]["error"] = None
-        jobs[job_id]["video_url"] = result["video_url"]
-        jobs[job_id]["email"] = result["email"]
+        jobs[job_id]["video"] = result["video_url"]
         jobs[job_id]["message"] = "Video generated successfully"
         jobs[job_id]["completed_at"] = time.time()
         
-        # Schedule cleanup after 30 minutes
-        def cleanup():
-            time.sleep(30 * 60)
-            jobs.pop(job_id, None)
-        
-        cleanup_thread = threading.Thread(target=cleanup)
-        cleanup_thread.start()
+        logger.info(f"Job {job_id}: Completed successfully")
         
     except Exception as e:
         # Update job with error
+        error_msg = str(e)
         jobs[job_id]["status"] = "failed"
-        jobs[job_id]["error"] = str(e)
-        jobs[job_id]["video_url"] = None
-        jobs[job_id]["message"] = f"Generation failed: {str(e)}"
+        jobs[job_id]["error"] = error_msg
+        jobs[job_id]["video"] = None
+        jobs[job_id]["message"] = f"Generation failed: {error_msg}"
         jobs[job_id]["completed_at"] = time.time()
         
+        logger.error(f"Job {job_id}: Failed with error: {error_msg}")
+    
+    finally:
         # Schedule cleanup after 30 minutes
         def cleanup():
             time.sleep(30 * 60)
-            jobs.pop(job_id, None)
+            if job_id in jobs:
+                del jobs[job_id]
+                logger.info(f"Job {job_id}: Cleaned up from memory")
         
         cleanup_thread = threading.Thread(target=cleanup)
+        cleanup_thread.daemon = True
         cleanup_thread.start()
 
 # ─── Flask Routes ───────────────────────────────────────────────────────────
 
 @app.route('/ping', methods=['GET'])
 def ping():
-    """Health check endpoint to keep the service awake"""
+    """Health check endpoint"""
     return "pong"
 
 @app.route('/generate', methods=['GET'])
 def generate_video():
-    """Start video generation with prompt and aspect ratio"""
+    """Start video generation"""
     prompt = request.args.get('prompt')
     aspect_ratio = request.args.get('size', '9:16')
     
-    # Validate prompt
     if not prompt:
         return jsonify({"error": "Missing 'prompt' parameter"}), 400
     
-    # Validate aspect ratio
     if aspect_ratio not in ['9:16', '16:9']:
         return jsonify({"error": "Invalid size. Use '9:16' or '16:9'"}), 400
     
@@ -424,16 +375,19 @@ def generate_video():
     jobs[job_id] = {
         "status": "pending",
         "error": None,
-        "video_url": None,
+        "video": None,
         "prompt": prompt,
         "aspect_ratio": aspect_ratio,
         "created_at": time.time(),
-        "message": "Job created, waiting to start"
+        "message": "Job created, starting soon"
     }
     
     # Start background task
     thread = threading.Thread(target=run_generation_task, args=(job_id, prompt, aspect_ratio))
+    thread.daemon = True
     thread.start()
+    
+    logger.info(f"Created job {job_id} for prompt: {prompt}")
     
     return jsonify({
         "job_id": job_id,
@@ -443,7 +397,7 @@ def generate_video():
 
 @app.route('/status', methods=['GET'])
 def get_status():
-    """Get the status of a video generation job"""
+    """Get job status"""
     job_id = request.args.get('jobid')
     
     if not job_id:
@@ -454,14 +408,12 @@ def get_status():
     if not job:
         return jsonify({"error": "Job not found"}), 404
     
-    # Return status in the requested format
     response = {
         "status": job["status"],
         "error": job.get("error"),
-        "video": job.get("video_url")
+        "video": job.get("video")
     }
     
-    # Include additional info if available
     if "message" in job:
         response["message"] = job["message"]
     
@@ -475,7 +427,6 @@ def list_jobs():
         active_jobs[job_id] = {
             "status": job["status"],
             "prompt": job["prompt"],
-            "aspect_ratio": job["aspect_ratio"],
             "created_at": job["created_at"],
             "message": job.get("message")
         }
