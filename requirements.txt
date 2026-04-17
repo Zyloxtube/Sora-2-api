@@ -2,3 +2,4 @@ Flask==2.3.3
 pycognito
 requests==2.31.0
 pycryptodome==3.19.0
+aiohttp
