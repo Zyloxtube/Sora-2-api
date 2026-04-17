@@ -1,13 +1,16 @@
 import os
 import re
 import time
-import threading
+import asyncio
 import uuid
 import logging
 from flask import Flask, request, jsonify
 from pycognito import Cognito
 import requests
 import traceback
+from concurrent.futures import ThreadPoolExecutor
+import aiohttp
+import asyncio
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
@@ -17,6 +20,9 @@ app = Flask(__name__)
 
 # Store jobs in memory
 jobs = {}
+
+# Create thread pool for CPU-bound operations
+executor = ThreadPoolExecutor(max_workers=10)
 
 # Configuration
 PASSWORD = "Test1234Abc!"
@@ -114,7 +120,7 @@ class TempEmail:
             time.sleep(interval)
         return None
 
-# ─── Cognito auth (FIXED - exactly like Discord bot) ─────────────────────────
+# ─── Cognito auth ─────────────────────────────────────────────────────────────
 
 def sign_up_with_cognito(email):
     try:
@@ -125,11 +131,9 @@ def sign_up_with_cognito(email):
             username=email,
             user_pool_region="eu-west-1",
         )
-        # Set attributes directly without add_custom_attributes
         cognito.email = email
         cognito.given_name = "User"
         cognito.family_name = "Test"
-        # Register the user
         cognito.register(username=email, password=PASSWORD)
         logger.info(f"Sign up successful for: {email}")
         return {"status": "success", "message": "User signed up, waiting for confirmation"}
@@ -296,10 +300,8 @@ def create_workspace(id_token):
         pass
     
     logger.info("Workspace setup complete")
-    time.sleep(30)  # Wait for workspace to be fully ready
+    time.sleep(30)
     return workspace_id
-
-# ─── Synthesia video generation ───────────────────────────────────────────────
 
 def start_synthesia_generation(token, workspace_id, prompt, aspect_ratio):
     try:
@@ -358,48 +360,41 @@ def poll_synthesia(token, asset_id, timeout=600, interval=10):
     
     raise TimeoutError("Generation timed out after 10 minutes")
 
-def generate_sora_video(prompt: str, aspect_ratio: str = "9:16", job_id: str = None, update_callback=None) -> dict:
-    """Generate a Sora video with progress updates"""
-    
-    def update_status(status, message):
-        if update_callback and job_id:
-            update_callback(job_id, status, message)
-    
+def generate_sora_video_sync(prompt: str, aspect_ratio: str = "9:16", job_id: str = None) -> dict:
+    """Synchronous version of video generation"""
     try:
-        update_status("accgen", "Creating temporary email...")
+        logger.info(f"Job {job_id}: Creating temporary email...")
         temp = TempEmail()
         email = temp.generate()
-        logger.info(f"Email created: {email}")
         
-        update_status("accgen", f"Signing up with email: {email}...")
+        logger.info(f"Job {job_id}: Signing up with email: {email}...")
         sign_up_result = sign_up_with_cognito(email)
         
-        update_status("accgen", "Waiting for verification code (checking inbox)...")
+        logger.info(f"Job {job_id}: Waiting for verification code...")
         code = temp.wait_for_code(timeout=120)
         if not code:
             raise RuntimeError("Timed out waiting for email verification code")
-        logger.info(f"Verification code received: {code}")
         
-        update_status("accgen", "Confirming email verification...")
+        logger.info(f"Job {job_id}: Confirming email verification...")
         confirm_sign_up_with_cognito(email, code)
         
-        update_status("accgen", "Signing in to account...")
+        logger.info(f"Job {job_id}: Signing in to account...")
         token = sign_in_with_cognito(email)
         
-        update_status("accgen", "Setting up Synthesia workspace...")
+        logger.info(f"Job {job_id}: Setting up Synthesia workspace...")
         workspace_id = create_workspace(token)
         
-        update_status("processing", "Starting video generation...")
+        logger.info(f"Job {job_id}: Starting video generation...")
         asset_id = start_synthesia_generation(token, workspace_id, prompt, aspect_ratio)
         
-        update_status("processing", "Generating video (this may take several minutes)...")
+        logger.info(f"Job {job_id}: Generating video (this may take several minutes)...")
         result = poll_synthesia(token, asset_id)
         
         video_url = result.get("url", "")
         if not video_url:
             raise RuntimeError("No video URL in response")
         
-        logger.info(f"Video generated successfully: {video_url}")
+        logger.info(f"Job {job_id}: Video generated successfully: {video_url}")
         return {
             "video_url": video_url,
             "email": email,
@@ -407,24 +402,24 @@ def generate_sora_video(prompt: str, aspect_ratio: str = "9:16", job_id: str = N
         }
         
     except Exception as e:
-        logger.error(f"Generation failed: {e}")
+        logger.error(f"Job {job_id}: Generation failed: {e}")
         logger.error(traceback.format_exc())
         raise
 
-# ─── Background task with progress updates ───────────────────────────────────
+# ─── Non-blocking task execution ───────────────────────────────────────────────
 
-def update_job_status(job_id, status, message):
-    """Callback to update job status"""
-    if job_id in jobs:
-        jobs[job_id]["status"] = status
-        jobs[job_id]["message"] = message
-        logger.info(f"Job {job_id}: {status} - {message}")
-
-def run_generation_task(job_id, prompt, aspect_ratio):
-    """Background task to generate video with detailed progress"""
+def run_generation_task_non_blocking(job_id, prompt, aspect_ratio):
+    """Run generation task without blocking the main thread"""
     try:
-        # Generate the video with progress updates
-        result = generate_sora_video(prompt, aspect_ratio, job_id, update_job_status)
+        # Update job status to processing
+        jobs[job_id]["status"] = "processing"
+        jobs[job_id]["message"] = "Starting video generation..."
+        
+        # Run the synchronous generation in the thread pool
+        future = executor.submit(generate_sora_video_sync, prompt, aspect_ratio, job_id)
+        
+        # Wait for result with timeout
+        result = future.result(timeout=900)  # 15 minute timeout
         
         # Update job with success
         jobs[job_id]["status"] = "done"
@@ -457,78 +452,114 @@ def run_generation_task(job_id, prompt, aspect_ratio):
         cleanup_thread.daemon = True
         cleanup_thread.start()
 
-# ─── Flask Routes ───────────────────────────────────────────────────────────
+# ─── Flask Routes (Non-blocking) ───────────────────────────────────────────────
 
 @app.route('/ping', methods=['GET'])
 def ping():
+    """Health check endpoint - immediate response"""
     return "pong"
 
-@app.route('/generate', methods=['GET'])
+@app.route('/generate', methods=['POST'])
 def generate_video():
-    prompt = request.args.get('prompt')
-    aspect_ratio = request.args.get('size', '9:16')
-    
-    if not prompt:
-        return jsonify({"error": "Missing 'prompt' parameter"}), 400
-    
-    if aspect_ratio not in ['9:16', '16:9']:
-        return jsonify({"error": "Invalid size. Use '9:16' or '16:9'"}), 400
-    
-    # Create job
-    job_id = str(uuid.uuid4())
-    jobs[job_id] = {
-        "status": "pending",
-        "error": None,
-        "video": None,
-        "prompt": prompt,
-        "aspect_ratio": aspect_ratio,
-        "created_at": time.time(),
-        "message": "Job created, starting soon"
-    }
-    
-    # Start background task
-    thread = threading.Thread(target=run_generation_task, args=(job_id, prompt, aspect_ratio))
-    thread.daemon = True
-    thread.start()
-    
-    logger.info(f"Created job {job_id} for prompt: {prompt}")
-    
-    return jsonify({
-        "job_id": job_id,
-        "message": "Video generation started",
-        "status_url": f"/status?jobid={job_id}"
-    })
+    """
+    Non-blocking video generation endpoint
+    Accepts JSON body: {"prompt": "...", "size": "9:16"}
+    Returns immediately with job_id
+    """
+    try:
+        data = request.get_json()
+        if not data:
+            return jsonify({"error": "Missing JSON body"}), 400
+        
+        prompt = data.get('prompt')
+        aspect_ratio = data.get('size', '9:16')
+        
+        if not prompt:
+            return jsonify({"error": "Missing 'prompt' field"}), 400
+        
+        if aspect_ratio not in ['9:16', '16:9']:
+            return jsonify({"error": "Invalid size. Use '9:16' or '16:9'"}), 400
+        
+        # Create job immediately
+        job_id = str(uuid.uuid4())
+        jobs[job_id] = {
+            "status": "pending",
+            "error": None,
+            "video": None,
+            "prompt": prompt,
+            "aspect_ratio": aspect_ratio,
+            "created_at": time.time(),
+            "message": "Job created, starting soon"
+        }
+        
+        # Start background task without blocking the response
+        import threading
+        thread = threading.Thread(
+            target=run_generation_task_non_blocking,
+            args=(job_id, prompt, aspect_ratio)
+        )
+        thread.daemon = True
+        thread.start()
+        
+        logger.info(f"Created job {job_id} for prompt: {prompt[:50]}...")
+        
+        # Return immediately with job ID
+        return jsonify({
+            "success": True,
+            "job_id": job_id,
+            "message": "Video generation started",
+            "status_endpoint": f"/status/{job_id}"
+        }), 202
+        
+    except Exception as e:
+        logger.error(f"Error in generate endpoint: {e}")
+        return jsonify({"error": str(e)}), 500
 
-@app.route('/status', methods=['GET'])
-def get_status():
-    job_id = request.args.get('jobid')
-    
-    if not job_id:
-        return jsonify({"error": "Missing 'jobid' parameter"}), 400
-    
+@app.route('/status/<job_id>', methods=['GET'])
+def get_status(job_id):
+    """
+    Get job status - returns immediately
+    Example response: {"status": "processing", "message": "...", "video": null}
+    """
     job = jobs.get(job_id)
     
     if not job:
         return jsonify({"error": "Job not found"}), 404
     
     response = {
+        "job_id": job_id,
         "status": job["status"],
-        "error": job.get("error"),
-        "video": job.get("video")
+        "message": job.get("message", ""),
+        "created_at": job["created_at"],
+        "completed_at": job.get("completed_at")
     }
     
-    if "message" in job:
-        response["message"] = job["message"]
+    if job["status"] == "done":
+        response["video_url"] = job.get("video")
+        response["download_url"] = job.get("video")  # Alias for convenience
+    
+    if job["status"] == "failed":
+        response["error"] = job.get("error")
     
     return jsonify(response)
 
+@app.route('/status', methods=['GET'])
+def get_status_by_param():
+    """Alternative status endpoint using query param"""
+    job_id = request.args.get('jobid')
+    if not job_id:
+        return jsonify({"error": "Missing 'jobid' parameter"}), 400
+    
+    return get_status(job_id)
+
 @app.route('/jobs', methods=['GET'])
 def list_jobs():
+    """List all active jobs - returns immediately"""
     active_jobs = {}
     for job_id, job in jobs.items():
         active_jobs[job_id] = {
             "status": job["status"],
-            "prompt": job["prompt"],
+            "prompt": job["prompt"][:50] + ("..." if len(job["prompt"]) > 50 else ""),
             "created_at": job["created_at"],
             "message": job.get("message")
         }
@@ -538,6 +569,63 @@ def list_jobs():
         "jobs": active_jobs
     })
 
+@app.route('/cancel/<job_id>', methods=['DELETE'])
+def cancel_job(job_id):
+    """Cancel a pending job"""
+    job = jobs.get(job_id)
+    
+    if not job:
+        return jsonify({"error": "Job not found"}), 404
+    
+    if job["status"] in ["done", "failed"]:
+        return jsonify({"error": f"Cannot cancel job with status: {job['status']}"}), 400
+    
+    # Mark as failed/cancelled
+    job["status"] = "failed"
+    job["error"] = "Cancelled by user"
+    job["message"] = "Job was cancelled"
+    job["completed_at"] = time.time()
+    
+    logger.info(f"Job {job_id}: Cancelled by user")
+    
+    return jsonify({
+        "success": True,
+        "message": f"Job {job_id} cancelled"
+    })
+
+# Cleanup old jobs periodically
+def cleanup_old_jobs():
+    """Remove jobs older than 1 hour"""
+    while True:
+        try:
+            current_time = time.time()
+            to_remove = []
+            
+            for job_id, job in jobs.items():
+                # Remove if completed more than 1 hour ago
+                if job.get("completed_at") and current_time - job["completed_at"] > 3600:
+                    to_remove.append(job_id)
+                # Remove if pending/processing for more than 30 minutes
+                elif job["status"] in ["pending", "processing"] and current_time - job["created_at"] > 1800:
+                    to_remove.append(job_id)
+            
+            for job_id in to_remove:
+                del jobs[job_id]
+                logger.info(f"Cleaned up old job: {job_id}")
+            
+            time.sleep(300)  # Run every 5 minutes
+            
+        except Exception as e:
+            logger.error(f"Cleanup error: {e}")
+            time.sleep(300)
+
 if __name__ == '__main__':
+    # Start cleanup thread
+    cleanup_thread = threading.Thread(target=cleanup_old_jobs)
+    cleanup_thread.daemon = True
+    cleanup_thread.start()
+    
     port = int(os.environ.get('PORT', 5000))
-    app.run(host='0.0.0.0', port=port, debug=False)
+    
+    # Use threaded=True for better concurrency
+    app.run(host='0.0.0.0', port=port, debug=False, threaded=True)
