@@ -6,6 +6,7 @@ import asyncio
 import uuid
 import logging
 from flask import Flask, request, jsonify
+from flask_cors import CORS  # Add this 
 from pycognito import Cognito
 import requests
 import traceback
