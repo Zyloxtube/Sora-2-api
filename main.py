@@ -5,8 +5,8 @@ import time
 import asyncio
 import uuid
 import logging
+import json
 from flask import Flask, request, jsonify
-# from flask_cors import CORS  # REMOVED - CORS blocking disabled
 from pycognito import Cognito
 import requests
 import traceback
@@ -316,31 +316,52 @@ def create_workspace(id_token):
 
 def start_synthesia_generation(token, workspace_id, prompt, aspect_ratio):
     try:
-        logger.info(f"Starting video generation with prompt: {prompt}")
+        logger.info(f"Starting video generation with prompt: {prompt} and aspect ratio: {aspect_ratio}")
+        
+        # Set dimensions based on aspect ratio
+        if aspect_ratio == "9:16":
+            width = 1080
+            height = 1920
+        else:  # 16:9
+            width = 1920
+            height = 1080
+        
         model_request = {
             "modelName": "sora_2",
             "generateAudio": True,
             "aspectRatio": aspect_ratio,
+            "width": width,
+            "height": height
         }
+        
+        payload = {
+            "mediaType": "video",
+            "modelRequest": model_request,
+            "userPrompt": prompt,
+            "workspaceId": workspace_id,
+        }
+        
+        logger.info(f"Sending payload to Synthesia: {json.dumps(payload, indent=2)}")
         
         r = requests.post(
             "https://api.prd.synthesia.io/avatarServices/api/generatedMedia/stockFootage/bulk?numberOfResults=1",
             headers={"Authorization": token, "Content-Type": "application/json"},
-            json={
-                "mediaType": "video",
-                "modelRequest": model_request,
-                "userPrompt": prompt,
-                "workspaceId": workspace_id,
-            },
+            json=payload,
             timeout=60,
         )
+        
+        logger.info(f"Synthesia response status: {r.status_code}")
+        logger.info(f"Synthesia response: {r.text[:500]}")
         r.raise_for_status()
+        
         result = r.json()
         if not result or len(result) == 0:
             raise RuntimeError("No asset ID returned")
+        
         asset_id = result[0]["mediaAssetId"]
         logger.info(f"Generation started, asset ID: {asset_id}")
         return asset_id
+        
     except Exception as e:
         logger.error(f"Failed to start generation: {e}")
         raise
@@ -395,7 +416,7 @@ def generate_sora_video_sync(prompt: str, aspect_ratio: str = "9:16", job_id: st
         logger.info(f"Job {job_id}: Setting up Synthesia workspace...")
         workspace_id = create_workspace(token)
         
-        logger.info(f"Job {job_id}: Starting video generation...")
+        logger.info(f"Job {job_id}: Starting video generation with aspect ratio {aspect_ratio}...")
         asset_id = start_synthesia_generation(token, workspace_id, prompt, aspect_ratio)
         
         logger.info(f"Job {job_id}: Generating video (this may take several minutes)...")
@@ -512,7 +533,7 @@ def generate_video():
         thread.daemon = True
         thread.start()
         
-        logger.info(f"Created job {job_id} for prompt: {prompt[:50]}...")
+        logger.info(f"Created job {job_id} for prompt: {prompt[:50]}... with aspect ratio: {aspect_ratio}")
         
         # Return immediately with job ID
         return jsonify({
