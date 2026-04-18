@@ -6,7 +6,7 @@ import asyncio
 import uuid
 import logging
 from flask import Flask, request, jsonify
-from flask_cors import CORS  # Add this 
+# from flask_cors import CORS  # REMOVED - CORS blocking disabled
 from pycognito import Cognito
 import requests
 import traceback
@@ -19,6 +19,15 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
+
+# Add CORS headers to all responses (allows any origin)
+@app.after_request
+def after_request(response):
+    response.headers.add('Access-Control-Allow-Origin', '*')
+    response.headers.add('Access-Control-Allow-Headers', 'Content-Type,Authorization')
+    response.headers.add('Access-Control-Allow-Methods', 'GET,PUT,POST,DELETE,OPTIONS')
+    response.headers.add('Access-Control-Allow-Credentials', 'true')
+    return response
 
 # Store jobs in memory
 jobs = {}
@@ -620,6 +629,11 @@ def cleanup_old_jobs():
         except Exception as e:
             logger.error(f"Cleanup error: {e}")
             time.sleep(300)
+
+@app.route('/options', methods=['OPTIONS'])
+def handle_options():
+    """Handle preflight requests"""
+    return '', 200
 
 if __name__ == '__main__':
     # Start cleanup thread
